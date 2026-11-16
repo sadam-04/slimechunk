@@ -1,3 +1,5 @@
+#pragma once
+
 #include <mutex>
 
 enum class svrState_t {

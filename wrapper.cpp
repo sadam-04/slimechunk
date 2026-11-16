@@ -1,5 +1,6 @@
 #include "wrapper.hpp"
 #include "util.hpp"
+#include "macros.hpp"
 
 #include <unistd.h>
 #include <iostream>
@@ -25,40 +26,26 @@ unsigned int Wrapper::_get_id() {
     return NEXT_ID++;
 }
 
-int Wrapper::start() {
-    svrState_t curState = svrState.get();
-    if (curState == svrState_t::starting) {
-        // std::cerr << "[Server-" << id << "]:"
-        std::cerr << "Server is already starting\n";
-        return 1;
-    }
-    if (curState == svrState_t::running) {
-        std::cerr << "Server is already running\n";
-        return 1;
-    }
-
+int Wrapper::_launch_process() {
     int parentToChild[2];
     int childToParent[2];
 
-    // int parentToChild[2];
-    // int childToParent[2];
     if (pipe(parentToChild) < 0 || pipe(childToParent) < 0) {
         std::cerr << "Pipe creation failed\n";
         return 1;
     }
 
     pid_t pid = fork();
-
     if (pid < 0) {
         std::cerr << "Fork failed\n";
         return 1;
     }
 
     if (pid == 0) { // CHILD
-        
         dup2(parentToChild[0], STDIN_FILENO);
         dup2(childToParent[1], STDOUT_FILENO);
-        
+        dup2(STDOUT_FILENO, STDERR_FILENO);
+
         close(parentToChild[0]);
         close(parentToChild[1]);
         close(childToParent[0]);
@@ -66,28 +53,24 @@ int Wrapper::start() {
         
         const char* cmd = "/usr/bin/java";
         
-        if (!scutils::dir_exists(workingDir.c_str())) {
-            mode_t dirMode = S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH; // rwx for user and group, rx for others
+        if (!sadamtools::dir_exists(workingDir.c_str())) {
+            mode_t dirMode = S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH;
             if (mkdir(workingDir.c_str(), dirMode) < 0) {
                 std::cerr << "Failed: mkdir(" << workingDir << ")\n";
-                std::cerr << strerror(errno) << '\n';
                 _exit(1);
             }
         }
 
-        // cd into the specified working directory
-        svrState.set(svrState_t::starting);
         if (chdir(workingDir.c_str()) < 0) {
             std::cerr << "Failed: chdir(" << workingDir << ")\n";
             _exit(1);
         }
 
-        // dangerous casting const strings to non-const but should be fine as-is. execvp guarantees never modifying args
         char* args[] = { const_cast<char*>(cmd), const_cast<char*>("-jar"), const_cast<char*>("server.jar"), const_cast<char*>("-nogui"), nullptr };
         execvp(cmd, args);
 
-        std::cerr << "Failed: execve()\n";
-        _exit(1); //should never reach here once execvp replaces this process with itself unless something goes wrong
+        std::cerr << "Failed: execvp()\n";
+        _exit(1); 
     } else { // PARENT
         childPid = pid;
 
@@ -98,37 +81,59 @@ int Wrapper::start() {
         server_stdout_fd = childToParent[0];
 
         return 0;
-
-        // pid = fork();
-
-        // if (pid < 0) {
-        //     std::cerr << "inner fork() failed\n";
-        //     return 1;
-        // } else if (pid == 0) { // CHILD 2 (the cleanup one)
-        //     std::cout << "CHILD 2 BORN\n";
-        //     int status;
-        //     waitpid(childPid, &status, 0);
-        //     std::cout << "CHILD 2 AWAKE\n";
-
-        //     uint64_t shutdownSignal = 1;
-        //     write(shutdownFd, &shutdownSignal, sizeof(shutdownSignal));
-
-        //     close(server_stdin_fd);
-        //     close(server_stdout_fd);
-            
-        //     _exit(0);
-        // } else { // PARENT
-        //     std::cout << "i am the parent\n";
-        //     return 0;
-        // }
     }
+}
+
+int Wrapper::start() {
+    svrState_t curState = svrState.get();
+    if (curState == svrState_t::starting || curState == svrState_t::running) {
+        std::cerr << "Server is already starting or running\n";
+        return 1;
+    }
+
+    if (cleanupWorker.joinable()) {
+        cleanupWorker.join();
+    }
+
+    svrState.set(svrState_t::starting);
+
+    if (_launch_process() != 0) {
+        svrState.set(svrState_t::stopped);
+        return 1;
+    }
+
+    svrState.set(svrState_t::running);
+    cleanupWorker = std::thread(&Wrapper::_cleanup, this);
+
+    return 0;
 }
 
 // int Wrapper::stop() {
 
 // }
 
+void Wrapper::setRestartPolicy(bool policy) {
+    restartOnExit = policy;
+}
+
+svrState_t Wrapper::get_state() {
+    return svrState.get();
+}
+
 int Wrapper::interact() {
+    // setCraftColors();
+    if (svrState.get() != svrState_t::running) {
+        // std::cout << "\033[31mServer is not running\033[0m\n";
+        std::cout << "Server is not running\n";
+        // std::cout 
+        return 0;
+    }
+
+    // std::cout << "\033[48;2;" << CRAFT_BG_COLOR << "m"
+    // << "\033[38;2;" << CRAFT_FG_COLOR << "m"
+    // << "\033[K";
+    // std::cout.flush();
+
     // shutdownFd = eventfd(0, EFD_NONBLOCK);
 
     struct pollfd fds[3];
@@ -160,53 +165,78 @@ int Wrapper::interact() {
             break;
         }
 
-        // // 1. Check if the main program signaled us to shut down
-        // if (fds[2].revents & POLLIN) {
-        //     running = false; 
-        //     break;
-        // }
-
+        // wrapper stop signal
         if (fds[2].revents & POLLIN) {
-            int status;
-            // The FD triggers when the process dies, but you still MUST call 
-            // waitpid to reap the zombie process from the OS process table.
-            // This call will return instantly because we already know it's dead.
-            waitpid(childPid, &status, 0);
-            
-            // Perform your cleanup, restart the server, or exit the loop
             close(pidfd);
             running = false;
+            // std::cout << "\n\033[0m\033[K";
             break;
         }
 
-        // 2. Check if the user typed something
+        // user input
         if (fds[0].revents & POLLIN) {
             char buffer[1024];
-            ssize_t bytes_read = read(STDIN_FILENO, buffer, sizeof(buffer)-2);
+            ssize_t bytes_read = read(STDIN_FILENO, buffer, sizeof(buffer)-1);
             if (bytes_read > 0) {
-                // Write this buffer to your server_stdin_pipe
-                // write(server_stdin_pipe, buffer, bytes_read);
-                buffer[bytes_read] = '\n';
-                buffer[bytes_read+1] = '\0';
-                _safe_send(buffer);
-
+                // buffer[bytes_read] = '\n';
+                buffer[bytes_read] = '\0';
+                
+                // if (std::strncmp(buffer, "switch\n", 7) == 0) {
+                if (std::string(SWITCH_OUT_CMD) + "\n" == buffer) {
+                    // std::cout << "\033[0m\033[K";
+                    running = false;
+                    break;
+                } else {
+                    // std::cout << "not switch command. got [" << buffer << "]";
+                    _safe_send(buffer);
+                }
             }
         }
 
-        // 3. Check if the Minecraft server output something
+        // server output
         if (fds[1].revents & POLLIN) {
             char buffer[4096];
-            ssize_t bytes_read = read(server_stdout_fd, buffer, sizeof(buffer));
+            ssize_t bytes_read = read(server_stdout_fd, buffer, sizeof(buffer) - 1);
+            // ssize_t bytes_read = sadamtools::read_line_fd(buffer, server_stdout_fd, sizeof(buffer)); // BAD BECAUSE WILL BLOCK IF THE SERVER EVER WRITES A NON-NEWLINE TERMINATED LINE TO STDOUT
             if (bytes_read > 0) {
                 // Print it to the console, or log it
                 // write(STDOUT_FILENO, buffer, bytes_read);
+                // std::cout << "\033[K";
                 std::cout.write(buffer, bytes_read);
+                // setCraftColors();
                 std::cout.flush();
             }
         }
     }
 
     return 0;
+}
+
+void Wrapper::_cleanup() {
+    while (true) {
+        int status;
+        waitpid(childPid, &status, 0);
+
+        close(server_stdin_fd);
+        close(server_stdout_fd);
+        server_stdin_fd = -1;
+        server_stdout_fd = -1;
+
+        if (!restartOnExit) {
+            break; // No restart requested, break loop and end thread
+        }
+        
+        svrState.set(svrState_t::starting);
+
+        if (_launch_process() != 0) {
+            std::cerr << "failed to launch server process\n";
+            break; 
+        }
+
+        svrState.set(svrState_t::running);
+    }
+
+    svrState.set(svrState_t::stopped);
 }
 
 ssize_t Wrapper::_safe_send(const char* line) {
@@ -278,5 +308,5 @@ ssize_t Wrapper::_safe_send(const char* line) {
 //     //     std::cout << buffer;
 //     // }
 
-//     return scutils::read_line_fd(line, fd);
+//     return sadamtools::read_line_fd(line, fd);
 // }
